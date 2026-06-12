@@ -71,6 +71,7 @@ ADMIN_SECRET_KEY = os.getenv("ADMIN_SECRET_KEY", "")
 EWURA_URL = "https://www.ewura.go.tz/pages/petroleum-product-pricing"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min default
+EIA_API_KEY = os.getenv("EIA_API_KEY", "DEMO_KEY")  # free demo key works for ~100 req/day
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -156,6 +157,15 @@ class SyncLog(Base):
     effective_date = Column(Date, nullable=True)
     records_upserted = Column(Integer, default=0)
     error_message = Column(String(1000), nullable=True)
+
+
+class BrentCrude(Base):
+    __tablename__ = "brent_crude"
+    __table_args__ = (UniqueConstraint("price_date", name="uq_brent_date"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    price_date = Column(Date, unique=True, index=True, nullable=False)
+    price_usd = Column(Float, nullable=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,8 +392,23 @@ class ForecastResponse(BaseModel):
     avg_period_days: int
     r_squared: Dict[str, float]
     trend_direction: Dict[str, str]
+    brent_last_known: Optional[float] = None
+    brent_forecast_inputs: Optional[List[float]] = None
     forecast: List[ForecastPoint]
     disclaimer: str
+
+
+class BrentPoint(BaseModel):
+    price_date: date
+    price_usd: float
+
+
+class BrentResponse(BaseModel):
+    count: int
+    from_date: date
+    to_date: date
+    latest_price_usd: float
+    series: List[BrentPoint]
 
 
 class ClusterDistrict(BaseModel):
@@ -1582,11 +1607,30 @@ def _compute_r2(ys: List[float], fitted_values: List[float]) -> float:
     return max(0.0, round(1.0 - ss_res / ss_tot, 4)) if ss_tot > 0 else 1.0
 
 
+def _project_brent(brent_series: List[float], periods: int) -> List[float]:
+    """Project Brent crude N months forward using ARIMA(1,1,0) — simple random walk with drift."""
+    try:
+        import numpy as np, warnings
+        from statsmodels.tsa.arima.model import ARIMA as _ARIMA
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fit = _ARIMA(np.asarray(brent_series, dtype=float), order=(1, 1, 0)).fit()
+        return [round(float(v), 2) for v in fit.get_forecast(steps=periods).predicted_mean]
+    except Exception:
+        n = len(brent_series)
+        m, b, _ = _ols(list(range(n)), brent_series)
+        return [round(m * (n + i) + b, 2) for i in range(1, periods + 1)]
+
+
 def _best_forecast(
-    ys: List[float], periods: int
+    ys: List[float],
+    periods: int,
+    brent_exog: Optional[List[float]] = None,
+    brent_future: Optional[List[float]] = None,
 ) -> Tuple[List[float], List[float], List[float], float, str, Dict]:
     """
-    Fits ARIMA(1,1,1), SARIMA(1,1,1)(1,0,0,12), and Holt-Winters ETS.
+    Fits ARIMA(1,1,1), SARIMA(1,1,1)(1,0,0,12), Holt-Winters ETS, and (when Brent
+    data is available) SARIMAX(1,1,1)(1,0,0,12) with Brent crude as exogenous variable.
     Selects the lowest-AIC model and returns its forecast.
     Returns (means, ci_lows, ci_highs, r_squared, model_name, comparison_dict).
     Falls back to OLS if all time-series models fail.
@@ -1638,11 +1682,36 @@ def _best_forecast(
         r2 = _compute_r2(ys, [float(v) for v in fit_hw.fittedvalues])
         return float(fit_hw.aic), fc, ci_lows, ci_highs, r2, "Holt-Winters (ETS)"
 
+    def _try_sarimax_x():
+        from statsmodels.tsa.statespace.sarimax import SARIMAX as _SARIMAX
+        exog_train = np.array(brent_exog, dtype=float).reshape(-1, 1)
+        exog_fcast = np.array(brent_future[:periods], dtype=float).reshape(-1, 1)
+        fit = _SARIMAX(
+            arr, exog=exog_train, order=(1, 1, 1), seasonal_order=(1, 0, 0, 12)
+        ).fit(disp=False)
+        fcast = fit.get_forecast(steps=periods, exog=exog_fcast)
+        ci = np.asarray(fcast.conf_int(alpha=0.05))
+        means = [round(float(v), 2) for v in fcast.predicted_mean]
+        ci_lows = [round(float(ci[i, 0]), 2) for i in range(periods)]
+        ci_highs = [round(float(ci[i, 1]), 2) for i in range(periods)]
+        r2 = _compute_r2(ys, [float(v) for v in fit.fittedvalues])
+        return float(fit.aic), means, ci_lows, ci_highs, r2, "SARIMAX-X (Brent crude)"
+
+    has_brent = (
+        brent_exog is not None
+        and brent_future is not None
+        and len(brent_exog) == n
+        and len(brent_future) >= periods
+        and sum(1 for v in brent_exog if v > 0) >= 12
+    )
+
     model_fns = [
         ("ARIMA(1,1,1)", _try_arima, 6),
         ("SARIMA(1,1,1)(1,0,0,12)", _try_sarima, 24),
         ("Holt-Winters (ETS)", _try_holtwinters, 24),
     ]
+    if has_brent:
+        model_fns.append(("SARIMAX-X (Brent crude)", _try_sarimax_x, 24))
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -2283,9 +2352,46 @@ def analytics_forecast(
     d_ys = [float(r[2] or 0) for r in avg_rows]
     k_ys = [float(r[3] or 0) for r in avg_rows]
 
-    p_means, p_ci_lows, p_ci_highs, p_r2, model_name, model_comparison = _best_forecast(p_ys, periods)
-    d_means, d_ci_lows, d_ci_highs, d_r2, _, _ = _best_forecast(d_ys, periods)
-    k_means, k_ci_lows, k_ci_highs, k_r2, _, _ = _best_forecast(k_ys, periods)
+    # Align Brent crude monthly prices to EWURA pricing dates
+    brent_exog: Optional[List[float]] = None
+    brent_future: Optional[List[float]] = None
+    brent_last_known: Optional[float] = None
+    try:
+        brent_rows = (
+            db.query(BrentCrude.price_date, BrentCrude.price_usd)
+            .order_by(BrentCrude.price_date)
+            .all()
+        )
+        if brent_rows:
+            brent_by_ym: Dict[Tuple[int, int], float] = {
+                (r[0].year, r[0].month): float(r[1]) for r in brent_rows
+            }
+            brent_last_known = float(brent_rows[-1][1])
+
+            def _nearest_brent(d) -> float:
+                # Walk back up to 3 months for closest available Brent price
+                for delta in range(4):
+                    y, m = (d.year, d.month - delta) if d.month > delta else (d.year - 1, d.month + 12 - delta)
+                    if (y, m) in brent_by_ym:
+                        return brent_by_ym[(y, m)]
+                return 0.0
+
+            aligned = [_nearest_brent(r[0]) for r in avg_rows]
+            if sum(1 for v in aligned if v > 0) >= 12:
+                brent_exog = aligned
+                brent_future = _project_brent([v for v in aligned if v > 0], periods)
+    except Exception:
+        pass
+
+    p_means, p_ci_lows, p_ci_highs, p_r2, model_name, model_comparison = _best_forecast(
+        p_ys, periods, brent_exog=brent_exog, brent_future=brent_future
+    )
+    d_means, d_ci_lows, d_ci_highs, d_r2, _, _ = _best_forecast(
+        d_ys, periods, brent_exog=brent_exog, brent_future=brent_future
+    )
+    k_means, k_ci_lows, k_ci_highs, k_r2, _, _ = _best_forecast(
+        k_ys, periods, brent_exog=brent_exog, brent_future=brent_future
+    )
 
     intervals = [
         (avg_rows[i][0] - avg_rows[i - 1][0]).days
@@ -2333,6 +2439,8 @@ def analytics_forecast(
             "diesel": _direction(d_ys),
             "kerosene": _direction(k_ys),
         },
+        brent_last_known=brent_last_known,
+        brent_forecast_inputs=brent_future,
         forecast=forecast,
         disclaimer=(
             "Forecasts are generated by automated time-series modelling (lowest-AIC model selected from "
@@ -2598,6 +2706,43 @@ def analytics_clusters(
     return result
 
 
+@app.get(
+    "/api/v1/analytics/brent",
+    response_model=BrentResponse,
+    tags=["Analytics — Deep"],
+    description=(
+        "Returns the full Brent crude oil price series stored in the database (USD/barrel, monthly). "
+        "Used by the forecast model as an exogenous variable. Sync fresh data via "
+        "`POST /api/v1/admin/sync-brent` (admin key required). "
+        "Empty if no Brent data has been synced yet."
+    ),
+)
+def analytics_brent(
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    _check_rate_limit(request)
+    cache_key = "analytics:brent"
+    hit = cache_get(cache_key)
+    if hit is not None:
+        return hit
+
+    rows = db.query(BrentCrude).order_by(BrentCrude.price_date).all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="No Brent crude data. Trigger POST /api/v1/admin/sync-brent first.")
+
+    series = [BrentPoint(price_date=r.price_date, price_usd=r.price_usd) for r in rows]
+    result = BrentResponse(
+        count=len(series),
+        from_date=rows[0].price_date,
+        to_date=rows[-1].price_date,
+        latest_price_usd=rows[-1].price_usd,
+        series=series,
+    )
+    cache_set(cache_key, result)
+    return result
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Export
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2724,3 +2869,68 @@ def backfill_status():
     if not _backfill_state:
         return {"status": "never_run", "message": "No backfill has been triggered yet."}
     return _backfill_state
+
+
+@app.post(
+    "/api/v1/admin/sync-brent",
+    tags=["Admin"],
+    dependencies=[Depends(verify_admin_key)],
+    description=(
+        "Pulls Brent crude monthly spot prices from the EIA API and upserts them into the "
+        "`brent_crude` table. Fetches up to 200 months of history. "
+        "Requires `X-API-KEY` header. Set `EIA_API_KEY` env var for higher rate limits "
+        "(free registration at eia.gov); the default DEMO_KEY works for ~100 requests/day."
+    ),
+)
+def sync_brent(db: Session = Depends(get_db)):
+    """Sync Brent crude prices from EIA. Requires X-API-KEY header."""
+    from datetime import date as _date
+
+    url = (
+        f"https://api.eia.gov/v2/seriesid/PET.RBRTE.M"
+        f"?api_key={EIA_API_KEY}&length=200"
+    )
+    try:
+        resp = requests.get(url, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"EIA API error: {exc}")
+
+    rows = data.get("response", {}).get("data", [])
+    if not rows:
+        raise HTTPException(status_code=502, detail="EIA returned no data. Check API key or series ID.")
+
+    upserted = 0
+    skipped = 0
+    for row in rows:
+        period = row.get("period", "")  # "YYYY-MM"
+        value = row.get("value")
+        if not period or value is None:
+            continue
+        try:
+            yr, mo = int(period[:4]), int(period[5:7])
+            price_date = _date(yr, mo, 1)
+            price_usd = float(value)
+        except (ValueError, TypeError):
+            continue
+
+        existing = db.query(BrentCrude).filter(BrentCrude.price_date == price_date).first()
+        if existing:
+            existing.price_usd = price_usd
+            skipped += 1
+        else:
+            db.add(BrentCrude(price_date=price_date, price_usd=price_usd))
+            upserted += 1
+
+    db.commit()
+    # Bust forecast cache so next call uses the updated Brent data
+    cache_clear()
+
+    return {
+        "status": "ok",
+        "inserted": upserted,
+        "updated": skipped,
+        "total_synced": upserted + skipped,
+        "latest_period": rows[0].get("period") if rows else None,
+    }
