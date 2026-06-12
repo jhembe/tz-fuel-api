@@ -1831,17 +1831,17 @@ def _best_forecast(
         and sum(1 for v in brent_exog if v > 0) >= 12
     )
 
-    # Brent quality check: reject if recent months show implausible jumps (> 25% MoM)
-    # EIA DEMO_KEY sometimes returns wrong 2026 data — this guards against corrupting SARIMAX-X
+    # Brent quality check: reject only truly implausible jumps (> 75% MoM) caused by stale DEMO_KEY data.
+    # Real geopolitical shocks (e.g. Strait of Hormuz 2026: Feb→Mar +45%) are legitimate and must pass.
     if has_brent:
         recent_b = [v for v in (brent_exog or [])[-6:] if v and v > 0]
         if len(recent_b) >= 2:
             mom_jumps = [abs(recent_b[i] - recent_b[i-1]) / recent_b[i-1] for i in range(1, len(recent_b))]
-            if max(mom_jumps) > 0.25:
+            if max(mom_jumps) > 0.75:
                 has_brent = False
                 comparison["SARIMAX-X (Brent crude)"] = {
                     "aic": None, "r_squared": None, "converged": False, "selected": False,
-                    "note": "Skipped — recent Brent data has implausible jump (>25% MoM). Register a free EIA API key at eia.gov for accurate data.",
+                    "note": "Skipped — recent Brent data has implausible jump (>75% MoM), likely stale EIA DEMO_KEY data.",
                 }
 
     model_fns = [

@@ -25,8 +25,8 @@ Dashboard at **[fuel.mahembega.com](https://fuel.mahembega.com)**
 
 ## Features
 
-- **10,996+ fuel price records** from 80 pricing periods (2009–present)
-- **192 districts** across mainland Tanzania and Zanzibar
+- **19,900+ fuel price records** from 131 pricing periods (2009–present)
+- **190 districts** across mainland Tanzania and Zanzibar
 - **Monthly PDF scraping** from EWURA's official website
 - **Automated scheduling** — new prices fetched on the 6th of each month
 - **Multi-model forecasting** — auto-selects best model (Holt-Winters ETS, ARIMA, SARIMA, SARIMAX-X with Brent crude)
@@ -88,9 +88,9 @@ The `/api/v1/analytics/forecast` endpoint fits four competing models and picks t
 | **SARIMA(1,1,1)(1,0,0,12)** | ARIMA with 12-month seasonal component |
 | **SARIMAX-X (Brent crude)** | SARIMA with Brent crude oil price as exogenous variable |
 
-As of June 2026, **Holt-Winters ETS wins** (AIC 256 vs 315+ for others) with R² ≈ 0.90 across all fuel types.
+As of June 2026, **Holt-Winters ETS wins** (AIC 386 vs 473+ for ARIMA/SARIMA/SARIMAX-X) with R² of 0.84–0.89 across fuel types. SARIMAX-X with Brent crude runs and is evaluated every call; it loses to Holt-Winters because TZS fuel prices are driven as much by exchange-rate depreciation as by raw oil prices, diluting Brent's predictive power.
 
-> For best SARIMAX-X accuracy, register a free EIA API key at [eia.gov/opendata](https://www.eia.gov/opendata/) and set `EIA_API_KEY` in your environment. The default `DEMO_KEY` can return unreliable recent data.
+> For best results, register a free EIA API key at [eia.gov/opendata](https://www.eia.gov/opendata/) and set `EIA_API_KEY` in your environment.
 
 ---
 
