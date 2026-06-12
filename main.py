@@ -76,6 +76,7 @@ EWURA_URL = "https://www.ewura.go.tz/pages/petroleum-product-pricing"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min default
 EIA_API_KEY = os.getenv("EIA_API_KEY", "DEMO_KEY")  # free demo key works for ~100 req/day
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")  # optional — register free at fred.stlouisfed.org for monthly TZS/USD data
 PDF_STORAGE_DIR = os.getenv("PDF_STORAGE_DIR", "/data/pdfs")
 
 
@@ -171,6 +172,15 @@ class BrentCrude(Base):
     id = Column(Integer, primary_key=True, index=True)
     price_date = Column(Date, unique=True, index=True, nullable=False)
     price_usd = Column(Float, nullable=False)
+
+
+class TzsUsdRate(Base):
+    __tablename__ = "tzs_usd_rate"
+    __table_args__ = (UniqueConstraint("rate_date", name="uq_tzs_rate_date"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    rate_date = Column(Date, unique=True, index=True, nullable=False)
+    rate_tzs_per_usd = Column(Float, nullable=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -399,6 +409,8 @@ class ForecastResponse(BaseModel):
     trend_direction: Dict[str, str]
     brent_last_known: Optional[float] = None
     brent_forecast_inputs: Optional[List[float]] = None
+    fx_last_known: Optional[float] = None
+    fx_forecast_inputs: Optional[List[float]] = None
     forecast: List[ForecastPoint]
     disclaimer: str
 
@@ -414,6 +426,20 @@ class BrentResponse(BaseModel):
     to_date: date
     latest_price_usd: float
     series: List[BrentPoint]
+
+
+class FxPoint(BaseModel):
+    rate_date: date
+    rate_tzs_per_usd: float
+
+
+class FxResponse(BaseModel):
+    count: int
+    from_date: date
+    to_date: date
+    latest_rate_tzs_per_usd: float
+    source: str
+    series: List[FxPoint]
 
 
 class ClusterDistrict(BaseModel):
@@ -1093,6 +1119,118 @@ def _sync_brent_prices() -> dict:
         db.close()
 
 
+def _sync_tzs_usd_rates() -> dict:
+    """Fetch TZS/USD exchange rates and upsert into DB.
+
+    Sources (tried in order):
+    1. FRED monthly series DEXTANUS (requires FRED_API_KEY env var — free at fred.stlouisfed.org)
+    2. World Bank PA.NUS.FCRF annual official rate + linear interpolation to monthly (full history)
+    3. open.er-api.com for the current month's spot rate (no key needed)
+    """
+    from calendar import monthrange as _monthrange
+
+    rates: Dict[Tuple[int, int], float] = {}  # (year, month) -> TZS/USD
+
+    # ── 1. FRED monthly (most accurate if key available) ──────────────────────
+    if FRED_API_KEY:
+        try:
+            url = (
+                "https://api.stlouisfed.org/fred/series/observations"
+                f"?series_id=DEXTANUS&api_key={FRED_API_KEY}&file_type=json"
+                "&frequency=m&aggregation_method=avg&observation_start=1960-01-01"
+            )
+            resp = requests.get(url, timeout=20)
+            if resp.status_code == 200:
+                for obs in resp.json().get("observations", []):
+                    v = obs.get("value", ".")
+                    if v == ".":
+                        continue
+                    try:
+                        d = date.fromisoformat(obs["date"])
+                        rates[(d.year, d.month)] = float(v)
+                    except (ValueError, KeyError, TypeError):
+                        continue
+                log.info("FX sync: fetched %d monthly rows from FRED", len(rates))
+        except Exception as exc:
+            log.warning("FX sync: FRED failed (%s), falling back to World Bank", exc)
+
+    # ── 2. World Bank annual (no key needed, full history back to 1960) ───────
+    if not rates:
+        try:
+            url = (
+                "https://api.worldbank.org/v2/country/TZA/indicator/PA.NUS.FCRF"
+                "?format=json&per_page=100&mrv=70"
+            )
+            resp = requests.get(url, timeout=20)
+            if resp.status_code == 200:
+                payload = resp.json()
+                annual: Dict[int, float] = {}
+                for entry in (payload[1] if len(payload) > 1 else []):
+                    yr_str = entry.get("date", "")
+                    val = entry.get("value")
+                    if val and yr_str:
+                        try:
+                            annual[int(yr_str)] = float(val)
+                        except (ValueError, TypeError):
+                            pass
+
+                # Linear interpolation from annual to monthly
+                sorted_years = sorted(annual.keys())
+                for i, yr in enumerate(sorted_years):
+                    rate_start = annual[yr]
+                    rate_end = annual[sorted_years[i + 1]] if i + 1 < len(sorted_years) else rate_start
+                    for mo in range(1, 13):
+                        # Blend linearly within the year towards next year's rate
+                        frac = (mo - 1) / 12.0
+                        rates[(yr, mo)] = round(rate_start + frac * (rate_end - rate_start), 2)
+
+                log.info("FX sync: interpolated %d monthly points from %d World Bank annual rows", len(rates), len(annual))
+        except Exception as exc:
+            log.warning("FX sync: World Bank failed — %s", exc)
+
+    # ── 3. Current spot rate to fill the most recent months ───────────────────
+    try:
+        resp = requests.get("https://open.er-api.com/v6/latest/USD", timeout=10)
+        if resp.status_code == 200:
+            tzs_rate = resp.json().get("rates", {}).get("TZS")
+            if tzs_rate:
+                today = date.today()
+                # Stamp to the 1st of current month
+                rates[(today.year, today.month)] = round(float(tzs_rate), 2)
+                log.info("FX sync: current spot rate %.2f TZS/USD from open.er-api.com", tzs_rate)
+    except Exception as exc:
+        log.warning("FX sync: open.er-api.com failed — %s", exc)
+
+    if not rates:
+        return {"status": "no_data", "error": "All FX data sources failed"}
+
+    db = SessionLocal()
+    inserted = updated = 0
+    try:
+        for (yr, mo), rate_val in rates.items():
+            try:
+                rate_date = date(yr, mo, 1)
+            except ValueError:
+                continue
+            existing = db.query(TzsUsdRate).filter(TzsUsdRate.rate_date == rate_date).first()
+            if existing:
+                existing.rate_tzs_per_usd = rate_val
+                updated += 1
+            else:
+                db.add(TzsUsdRate(rate_date=rate_date, rate_tzs_per_usd=rate_val))
+                inserted += 1
+        db.commit()
+        cache_clear()
+        log.info("FX sync done — inserted=%d updated=%d", inserted, updated)
+        return {"status": "ok", "inserted": inserted, "updated": updated, "total": inserted + updated}
+    except Exception as exc:
+        db.rollback()
+        log.exception("FX sync DB error: %s", exc)
+        return {"status": "failed", "error": str(exc)}
+    finally:
+        db.close()
+
+
 async def _scheduled_ewura_sync():
     """Monthly EWURA price bulletin sync — runs the scraper in a thread pool."""
     log.info("Scheduled EWURA sync triggered")
@@ -1108,9 +1246,29 @@ async def _scheduled_brent_sync():
     log.info("Scheduled Brent sync result: %s", result)
 
 
+async def _scheduled_fx_sync():
+    """Monthly TZS/USD exchange rate sync — runs in a thread pool."""
+    log.info("Scheduled FX sync triggered")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _sync_tzs_usd_rates)
+    log.info("Scheduled FX sync result: %s", result)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # App Bootstrap
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _seed_fx_on_boot():
+    """Run FX sync on boot only if the table is empty."""
+    db = SessionLocal()
+    try:
+        count = db.query(TzsUsdRate).count()
+    finally:
+        db.close()
+    if count == 0:
+        log.info("tzs_usd_rate table empty — seeding exchange rate history on boot")
+        _sync_tzs_usd_rates()
 
 
 @asynccontextmanager
@@ -1139,8 +1297,19 @@ async def lifespan(app: FastAPI):
         id="brent_monthly",
         replace_existing=True,
     )
+    # Exchange rate sync: World Bank updates annually; open.er-api gives current spot on the 5th
+    _scheduler.add_job(
+        _scheduled_fx_sync,
+        CronTrigger(day=5, hour=6, minute=30, timezone="UTC"),
+        id="fx_monthly",
+        replace_existing=True,
+    )
     _scheduler.start()
-    log.info("Scheduler started — EWURA sync: 6th of month 07:00 EAT · Brent sync: 5th of month 06:00 UTC")
+    log.info("Scheduler started — EWURA sync: 6th 07:00 EAT · Brent sync: 5th 06:00 UTC · FX sync: 5th 06:30 UTC")
+
+    # Seed exchange rate history on first boot if table is empty
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, _seed_fx_on_boot)
 
     yield
 
@@ -1748,15 +1917,33 @@ def _project_brent(brent_series: List[float], periods: int) -> List[float]:
         return [round(m * (n + i) + b, 2) for i in range(1, periods + 1)]
 
 
+def _project_fx(fx_series: List[float], periods: int) -> List[float]:
+    """Project TZS/USD exchange rate N months forward using ARIMA(1,1,0)."""
+    try:
+        import numpy as np, warnings
+        from statsmodels.tsa.arima.model import ARIMA as _ARIMA
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fit = _ARIMA(np.asarray(fx_series, dtype=float), order=(1, 1, 0)).fit()
+        return [round(float(v), 2) for v in fit.get_forecast(steps=periods).predicted_mean]
+    except Exception:
+        n = len(fx_series)
+        m, b, _ = _ols(list(range(n)), fx_series)
+        return [round(m * (n + i) + b, 2) for i in range(1, periods + 1)]
+
+
 def _best_forecast(
     ys: List[float],
     periods: int,
     brent_exog: Optional[List[float]] = None,
     brent_future: Optional[List[float]] = None,
+    fx_exog: Optional[List[float]] = None,
+    fx_future: Optional[List[float]] = None,
 ) -> Tuple[List[float], List[float], List[float], float, str, Dict]:
     """
     Fits ARIMA(1,1,1), SARIMA(1,1,1)(1,0,0,12), Holt-Winters ETS, and (when Brent
-    data is available) SARIMAX(1,1,1)(1,0,0,12) with Brent crude as exogenous variable.
+    data is available) SARIMAX(1,1,1)(1,0,0,12) with oil cost in TZS (Brent × TZS/USD)
+    as exogenous variable — or Brent alone if exchange rate data is unavailable.
     Selects the lowest-AIC model and returns its forecast.
     Returns (means, ci_lows, ci_highs, r_squared, model_name, comparison_dict).
     Falls back to OLS if all time-series models fail.
@@ -1810,8 +1997,30 @@ def _best_forecast(
 
     def _try_sarimax_x():
         from statsmodels.tsa.statespace.sarimax import SARIMAX as _SARIMAX
-        exog_train = np.array(brent_exog, dtype=float).reshape(-1, 1)
-        exog_fcast = np.array(brent_future[:periods], dtype=float).reshape(-1, 1)
+
+        has_fx = (
+            fx_exog is not None
+            and fx_future is not None
+            and len(fx_exog) == n
+            and len(fx_future) >= periods
+            and sum(1 for v in fx_exog if v and v > 0) >= 12
+        )
+
+        if has_fx:
+            # Combined variable: "what a barrel of oil actually costs in TZS"
+            # This is the direct cost driver for EWURA prices — much stronger predictor than Brent alone
+            exog_train = np.array(
+                [b * f for b, f in zip(brent_exog, fx_exog)], dtype=float
+            ).reshape(-1, 1)
+            exog_fcast = np.array(
+                [b * f for b, f in zip(brent_future[:periods], fx_future[:periods])], dtype=float
+            ).reshape(-1, 1)
+            model_label = "SARIMAX-X (oil cost in TZS)"
+        else:
+            exog_train = np.array(brent_exog, dtype=float).reshape(-1, 1)
+            exog_fcast = np.array(brent_future[:periods], dtype=float).reshape(-1, 1)
+            model_label = "SARIMAX-X (Brent crude)"
+
         fit = _SARIMAX(
             arr, exog=exog_train, order=(1, 1, 1), seasonal_order=(1, 0, 0, 12)
         ).fit(disp=False)
@@ -1821,7 +2030,7 @@ def _best_forecast(
         ci_lows = [round(float(ci[i, 0]), 2) for i in range(periods)]
         ci_highs = [round(float(ci[i, 1]), 2) for i in range(periods)]
         r2 = _compute_r2(ys, [float(v) for v in fit.fittedvalues])
-        return float(fit.aic), means, ci_lows, ci_highs, r2, "SARIMAX-X (Brent crude)"
+        return float(fit.aic), means, ci_lows, ci_highs, r2, model_label
 
     has_brent = (
         brent_exog is not None
@@ -1833,13 +2042,19 @@ def _best_forecast(
 
     # Brent quality check: reject only truly implausible jumps (> 75% MoM) caused by stale DEMO_KEY data.
     # Real geopolitical shocks (e.g. Strait of Hormuz 2026: Feb→Mar +45%) are legitimate and must pass.
+    _sarimax_key = "SARIMAX-X (oil cost in TZS)" if (
+        fx_exog is not None and fx_future is not None
+        and len(fx_exog) == n and len(fx_future) >= periods
+        and sum(1 for v in fx_exog if v and v > 0) >= 12
+    ) else "SARIMAX-X (Brent crude)"
+
     if has_brent:
         recent_b = [v for v in (brent_exog or [])[-6:] if v and v > 0]
         if len(recent_b) >= 2:
             mom_jumps = [abs(recent_b[i] - recent_b[i-1]) / recent_b[i-1] for i in range(1, len(recent_b))]
             if max(mom_jumps) > 0.75:
                 has_brent = False
-                comparison["SARIMAX-X (Brent crude)"] = {
+                comparison[_sarimax_key] = {
                     "aic": None, "r_squared": None, "converged": False, "selected": False,
                     "note": "Skipped — recent Brent data has implausible jump (>75% MoM), likely stale EIA DEMO_KEY data.",
                 }
@@ -1850,7 +2065,7 @@ def _best_forecast(
         ("Holt-Winters (ETS)", _try_holtwinters, 24),
     ]
     if has_brent:
-        model_fns.append(("SARIMAX-X (Brent crude)", _try_sarimax_x, 24))
+        model_fns.append((_sarimax_key, _try_sarimax_x, 24))
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -2491,6 +2706,13 @@ def analytics_forecast(
     d_ys = [float(r[2] or 0) for r in avg_rows]
     k_ys = [float(r[3] or 0) for r in avg_rows]
 
+    def _nearest_by_ym(d, by_ym: Dict[Tuple[int, int], float]) -> float:
+        for delta in range(4):
+            y, m = (d.year, d.month - delta) if d.month > delta else (d.year - 1, d.month + 12 - delta)
+            if (y, m) in by_ym:
+                return by_ym[(y, m)]
+        return 0.0
+
     # Align Brent crude monthly prices to EWURA pricing dates
     brent_exog: Optional[List[float]] = None
     brent_future: Optional[List[float]] = None
@@ -2506,30 +2728,46 @@ def analytics_forecast(
                 (r[0].year, r[0].month): float(r[1]) for r in brent_rows
             }
             brent_last_known = float(brent_rows[-1][1])
-
-            def _nearest_brent(d) -> float:
-                # Walk back up to 3 months for closest available Brent price
-                for delta in range(4):
-                    y, m = (d.year, d.month - delta) if d.month > delta else (d.year - 1, d.month + 12 - delta)
-                    if (y, m) in brent_by_ym:
-                        return brent_by_ym[(y, m)]
-                return 0.0
-
-            aligned = [_nearest_brent(r[0]) for r in avg_rows]
+            aligned = [_nearest_by_ym(r[0], brent_by_ym) for r in avg_rows]
             if sum(1 for v in aligned if v > 0) >= 12:
                 brent_exog = aligned
                 brent_future = _project_brent([v for v in aligned if v > 0], periods)
     except Exception:
         pass
 
+    # Align TZS/USD exchange rates to EWURA pricing dates
+    fx_exog: Optional[List[float]] = None
+    fx_future: Optional[List[float]] = None
+    fx_last_known: Optional[float] = None
+    try:
+        fx_rows = (
+            db.query(TzsUsdRate.rate_date, TzsUsdRate.rate_tzs_per_usd)
+            .order_by(TzsUsdRate.rate_date)
+            .all()
+        )
+        if fx_rows:
+            fx_by_ym: Dict[Tuple[int, int], float] = {
+                (r[0].year, r[0].month): float(r[1]) for r in fx_rows
+            }
+            fx_last_known = float(fx_rows[-1][1])
+            aligned_fx = [_nearest_by_ym(r[0], fx_by_ym) for r in avg_rows]
+            if sum(1 for v in aligned_fx if v > 0) >= 12:
+                fx_exog = aligned_fx
+                fx_future = _project_fx([v for v in aligned_fx if v > 0], periods)
+    except Exception:
+        pass
+
     p_means, p_ci_lows, p_ci_highs, p_r2, model_name, model_comparison = _best_forecast(
-        p_ys, periods, brent_exog=brent_exog, brent_future=brent_future
+        p_ys, periods, brent_exog=brent_exog, brent_future=brent_future,
+        fx_exog=fx_exog, fx_future=fx_future,
     )
     d_means, d_ci_lows, d_ci_highs, d_r2, _, _ = _best_forecast(
-        d_ys, periods, brent_exog=brent_exog, brent_future=brent_future
+        d_ys, periods, brent_exog=brent_exog, brent_future=brent_future,
+        fx_exog=fx_exog, fx_future=fx_future,
     )
     k_means, k_ci_lows, k_ci_highs, k_r2, _, _ = _best_forecast(
-        k_ys, periods, brent_exog=brent_exog, brent_future=brent_future
+        k_ys, periods, brent_exog=brent_exog, brent_future=brent_future,
+        fx_exog=fx_exog, fx_future=fx_future,
     )
 
     intervals = [
@@ -2580,11 +2818,13 @@ def analytics_forecast(
         },
         brent_last_known=brent_last_known,
         brent_forecast_inputs=brent_future,
+        fx_last_known=fx_last_known,
+        fx_forecast_inputs=fx_future,
         forecast=forecast,
         disclaimer=(
             "Forecasts are generated by automated time-series modelling (lowest-AIC model selected from "
-            "ARIMA, SARIMA, and Holt-Winters ETS). They do not reflect EWURA's pricing methodology, "
-            "global oil markets, exchange rates, or regulatory decisions. "
+            "ARIMA, SARIMA, Holt-Winters ETS, and SARIMAX-X with oil cost in TZS). "
+            "They do not reflect EWURA's pricing methodology or regulatory decisions. "
             "Do not use for financial or policy decisions."
         ),
     )
@@ -2876,6 +3116,50 @@ def analytics_brent(
         from_date=rows[0].price_date,
         to_date=rows[-1].price_date,
         latest_price_usd=rows[-1].price_usd,
+        series=series,
+    )
+    cache_set(cache_key, result)
+    return result
+
+
+@app.get(
+    "/api/v1/analytics/exchange-rate",
+    response_model=FxResponse,
+    tags=["Analytics — Deep"],
+    description=(
+        "Returns the full TZS/USD exchange rate series stored in the database (monthly). "
+        "Annual data comes from the World Bank official rates (PA.NUS.FCRF), interpolated monthly. "
+        "The most recent month is supplemented with the spot rate from open.er-api.com. "
+        "Used by the forecast model alongside Brent crude to compute 'oil cost in TZS' — "
+        "the most direct predictor of EWURA fuel prices. "
+        "Sync fresh data via `POST /api/v1/admin/sync-fx` (admin key required)."
+    ),
+)
+def analytics_exchange_rate(
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    _check_rate_limit(request)
+    cache_key = "analytics:exchange_rate"
+    hit = cache_get(cache_key)
+    if hit is not None:
+        return hit
+
+    rows = db.query(TzsUsdRate).order_by(TzsUsdRate.rate_date).all()
+    if not rows:
+        raise HTTPException(
+            status_code=404,
+            detail="No exchange rate data. Trigger POST /api/v1/admin/sync-fx first.",
+        )
+
+    series = [FxPoint(rate_date=r.rate_date, rate_tzs_per_usd=r.rate_tzs_per_usd) for r in rows]
+    result = FxResponse(
+        count=len(series),
+        from_date=rows[0].rate_date,
+        to_date=rows[-1].rate_date,
+        latest_rate_tzs_per_usd=rows[-1].rate_tzs_per_usd,
+        source="World Bank PA.NUS.FCRF (annual, interpolated monthly) + open.er-api.com (current spot)"
+        if not FRED_API_KEY else "FRED DEXTANUS (monthly) + open.er-api.com (current spot)",
         series=series,
     )
     cache_set(cache_key, result)
@@ -3196,3 +3480,23 @@ def sync_brent(db: Session = Depends(get_db)):
         "total_synced": upserted + skipped,
         "latest_period": rows[0].get("period") if rows else None,
     }
+
+
+@app.post(
+    "/api/v1/admin/sync-fx",
+    tags=["Admin"],
+    dependencies=[Depends(verify_admin_key)],
+    description=(
+        "Syncs TZS/USD exchange rate history into the `tzs_usd_rate` table. "
+        "Primary source: FRED DEXTANUS monthly series (set `FRED_API_KEY` env var — free at fred.stlouisfed.org). "
+        "Fallback: World Bank PA.NUS.FCRF annual official rates interpolated monthly. "
+        "Current spot rate always fetched from open.er-api.com (no key needed). "
+        "Requires `X-API-KEY` header."
+    ),
+)
+def sync_fx():
+    """Sync TZS/USD exchange rates. Requires X-API-KEY header."""
+    result = _sync_tzs_usd_rates()
+    if result.get("status") == "failed":
+        raise HTTPException(status_code=502, detail=result.get("error", "FX sync failed"))
+    return result

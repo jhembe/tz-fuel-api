@@ -6,6 +6,7 @@ services:
     environment:
       DATABASE_URL: postgresql://fuel_app:TzFuel2026!@postgres:5432/tz_fuel
       ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY:-change-me}
+      FRED_API_KEY: ${FRED_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
     volumes:
