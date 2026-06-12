@@ -1719,10 +1719,17 @@ def _ols(xs: List[float], ys: List[float]) -> Tuple[float, float, float]:
 
 
 def _compute_r2(ys: List[float], fitted_values: List[float]) -> float:
+    import math as _math
     actual = ys[-len(fitted_values):]
-    y_mean = sum(actual) / len(actual) if actual else 1.0
-    ss_res = sum((a - f) ** 2 for a, f in zip(actual, fitted_values))
-    ss_tot = sum((a - y_mean) ** 2 for a in actual)
+    # Drop pairs where the fitted value is NaN/inf (common at start of ARIMA/SARIMA series)
+    pairs = [(a, f) for a, f in zip(actual, fitted_values) if _math.isfinite(a) and _math.isfinite(f)]
+    if not pairs:
+        return 0.0
+    a_vals = [a for a, _ in pairs]
+    f_vals = [f for _, f in pairs]
+    y_mean = sum(a_vals) / len(a_vals)
+    ss_res = sum((a - f) ** 2 for a, f in zip(a_vals, f_vals))
+    ss_tot = sum((a - y_mean) ** 2 for a in a_vals)
     return max(0.0, round(1.0 - ss_res / ss_tot, 4)) if ss_tot > 0 else 1.0
 
 
@@ -1787,7 +1794,7 @@ def _best_forecast(
     def _try_holtwinters():
         from statsmodels.tsa.holtwinters import ExponentialSmoothing as _ES
         fit_hw = _ES(
-            arr, trend="add", seasonal="add", seasonal_periods=12,
+            arr, trend="add", damped_trend=True, seasonal="add", seasonal_periods=12,
             initialization_method="estimated",
         ).fit(optimized=True)
         fc = [round(float(v), 2) for v in fit_hw.forecast(steps=periods)]
@@ -1823,6 +1830,19 @@ def _best_forecast(
         and len(brent_future) >= periods
         and sum(1 for v in brent_exog if v > 0) >= 12
     )
+
+    # Brent quality check: reject if recent months show implausible jumps (> 25% MoM)
+    # EIA DEMO_KEY sometimes returns wrong 2026 data — this guards against corrupting SARIMAX-X
+    if has_brent:
+        recent_b = [v for v in (brent_exog or [])[-6:] if v and v > 0]
+        if len(recent_b) >= 2:
+            mom_jumps = [abs(recent_b[i] - recent_b[i-1]) / recent_b[i-1] for i in range(1, len(recent_b))]
+            if max(mom_jumps) > 0.25:
+                has_brent = False
+                comparison["SARIMAX-X (Brent crude)"] = {
+                    "aic": None, "r_squared": None, "converged": False, "selected": False,
+                    "note": "Skipped — recent Brent data has implausible jump (>25% MoM). Register a free EIA API key at eia.gov for accurate data.",
+                }
 
     model_fns = [
         ("ARIMA(1,1,1)", _try_arima, 6),
@@ -2440,7 +2460,7 @@ def analytics_correlation(
 )
 def analytics_forecast(
     periods: int = Query(3, ge=1, le=12, description="Number of future periods to project"),
-    training_periods: int = Query(24, ge=6, le=80, description="How many recent periods to train on"),
+    training_periods: int = Query(36, ge=6, le=80, description="How many recent periods to train on"),
     request: Request = None,
     db: Session = Depends(get_db),
 ):
