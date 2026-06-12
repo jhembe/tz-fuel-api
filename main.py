@@ -3,12 +3,14 @@ Tanzania Public Fuel Price API — v2.0
 Production-grade FastAPI service sourcing cap prices from EWURA PDFs.
 """
 
+import asyncio
 import csv
 import io
 import logging
 import math
 import os
 import re
+import shutil
 import statistics
 import tempfile
 import time
@@ -20,6 +22,8 @@ from typing import Dict, List, Optional, Set, Tuple
 
 import pdfplumber
 import requests
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from bs4 import BeautifulSoup
 from fastapi import (
     BackgroundTasks,
@@ -33,7 +37,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security.api_key import APIKeyHeader
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import (
@@ -72,6 +76,7 @@ EWURA_URL = "https://www.ewura.go.tz/pages/petroleum-product-pricing"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "300"))  # 5 min default
 EIA_API_KEY = os.getenv("EIA_API_KEY", "DEMO_KEY")  # free demo key works for ~100 req/day
+PDF_STORAGE_DIR = os.getenv("PDF_STORAGE_DIR", "/data/pdfs")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -770,7 +775,21 @@ def _parse_price(cell: str) -> Optional[float]:
     return None
 
 
-def parse_ewura_pdf(pdf_path: str, fallback_date: date, db: Session) -> int:
+def _get_stored_pdf_path(effective_date: date) -> str:
+    return os.path.join(PDF_STORAGE_DIR, f"ewura_{effective_date.isoformat()}.pdf")
+
+
+def _save_pdf_to_storage(temp_path: str, effective_date: date) -> None:
+    try:
+        os.makedirs(PDF_STORAGE_DIR, exist_ok=True)
+        dest = _get_stored_pdf_path(effective_date)
+        shutil.copy2(temp_path, dest)
+        log.info("PDF saved → %s", dest)
+    except Exception as exc:
+        log.warning("Could not save PDF to storage: %s", exc)
+
+
+def parse_ewura_pdf(pdf_path: str, fallback_date: date, db: Session) -> Tuple[int, date]:
     effective_date = extract_date_from_pdf(pdf_path) or fallback_date
     log.info("Effective date: %s", effective_date)
     upserted = 0
@@ -863,7 +882,7 @@ def parse_ewura_pdf(pdf_path: str, fallback_date: date, db: Session) -> int:
 
     cache_clear()
     log.info("Upserted %d price records (date=%s)", upserted, effective_date)
-    return upserted
+    return upserted, effective_date
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -895,10 +914,11 @@ def background_scraper_task(factory) -> None:
         db.commit()
 
         pdf_path = download_pdf(pdf_url)
-        count = parse_ewura_pdf(pdf_path, date.today(), db)
+        count, eff_date = parse_ewura_pdf(pdf_path, date.today(), db)
 
         log_entry.status = "success"
         log_entry.records_upserted = count
+        log_entry.effective_date = eff_date
         db.commit()
         log.info("Sync done — %d records.", count)
 
@@ -909,6 +929,8 @@ def background_scraper_task(factory) -> None:
         db.commit()
     finally:
         if pdf_path and os.path.exists(pdf_path):
+            if log_entry.effective_date:
+                _save_pdf_to_storage(pdf_path, log_entry.effective_date)
             os.remove(pdf_path)
         db.close()
 
@@ -964,7 +986,7 @@ def background_backfill_task(factory) -> None:
                     _backfill_state["skipped"] = _backfill_state["skipped"] + 1  # type: ignore[operator]
                     continue
 
-                count = parse_ewura_pdf(pdf_path, eff_date, db)
+                count, eff_date = parse_ewura_pdf(pdf_path, eff_date, db)
                 existing_dates.add(eff_date)
                 _backfill_state["total_records"] = _backfill_state["total_records"] + count  # type: ignore[operator]
 
@@ -995,6 +1017,8 @@ def background_backfill_task(factory) -> None:
                     db.rollback()
             finally:
                 if pdf_path and os.path.exists(pdf_path):
+                    if eff_date:
+                        _save_pdf_to_storage(pdf_path, eff_date)
                     os.remove(pdf_path)
                 _backfill_state["done"] = _backfill_state["done"] + 1  # type: ignore[operator]
 
@@ -1014,6 +1038,77 @@ def background_backfill_task(factory) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Background Scheduler — automatic Brent + EWURA syncing
+# ─────────────────────────────────────────────────────────────────────────────
+
+_scheduler = AsyncIOScheduler()
+
+
+def _sync_brent_prices() -> dict:
+    """Pull Brent crude monthly prices from EIA and upsert into DB."""
+    url = f"https://api.eia.gov/v2/seriesid/PET.RBRTE.M?api_key={EIA_API_KEY}&length=200"
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as exc:
+        log.error("Brent auto-sync: EIA request failed — %s", exc)
+        return {"status": "failed", "error": str(exc)}
+
+    rows = data.get("response", {}).get("data", [])
+    if not rows:
+        log.warning("Brent auto-sync: EIA returned no data rows")
+        return {"status": "no_data"}
+
+    db = SessionLocal()
+    upserted = updated = 0
+    try:
+        for row in rows:
+            period = row.get("period", "")
+            value = row.get("value")
+            if not period or value is None:
+                continue
+            try:
+                yr, mo = int(period[:4]), int(period[5:7])
+                price_date = date(yr, mo, 1)
+                price_usd = float(value)
+            except (ValueError, TypeError):
+                continue
+            existing = db.query(BrentCrude).filter(BrentCrude.price_date == price_date).first()
+            if existing:
+                existing.price_usd = price_usd
+                updated += 1
+            else:
+                db.add(BrentCrude(price_date=price_date, price_usd=price_usd))
+                upserted += 1
+        db.commit()
+        cache_clear()
+        log.info("Brent auto-sync done — inserted=%d updated=%d", upserted, updated)
+        return {"status": "ok", "inserted": upserted, "updated": updated}
+    except Exception as exc:
+        db.rollback()
+        log.exception("Brent auto-sync DB error: %s", exc)
+        return {"status": "failed", "error": str(exc)}
+    finally:
+        db.close()
+
+
+async def _scheduled_ewura_sync():
+    """Monthly EWURA price bulletin sync — runs the scraper in a thread pool."""
+    log.info("Scheduled EWURA sync triggered")
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, background_scraper_task, SessionLocal)
+
+
+async def _scheduled_brent_sync():
+    """Monthly Brent crude sync — runs in a thread pool."""
+    log.info("Scheduled Brent sync triggered")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _sync_brent_prices)
+    log.info("Scheduled Brent sync result: %s", result)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # App Bootstrap
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1021,12 +1116,36 @@ def background_backfill_task(factory) -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    os.makedirs(PDF_STORAGE_DIR, exist_ok=True)
     log.info(
-        "DB tables ready (%s). ADMIN_SECRET_KEY %s.",
+        "DB tables ready (%s). ADMIN_SECRET_KEY %s. PDF storage: %s",
         "SQLite" if IS_SQLITE else "PostgreSQL",
         "SET" if ADMIN_SECRET_KEY else "NOT SET — admin endpoints disabled",
+        PDF_STORAGE_DIR,
     )
+
+    # Schedule automatic monthly syncs
+    # EWURA publishes new bulletins around the 1st–5th; run on the 6th to be safe
+    _scheduler.add_job(
+        _scheduled_ewura_sync,
+        CronTrigger(day=6, hour=7, minute=0, timezone="Africa/Dar_es_Salaam"),
+        id="ewura_monthly",
+        replace_existing=True,
+    )
+    # EIA Brent data is released ~30 days after month-end; fetch on the 5th
+    _scheduler.add_job(
+        _scheduled_brent_sync,
+        CronTrigger(day=5, hour=6, minute=0, timezone="UTC"),
+        id="brent_monthly",
+        replace_existing=True,
+    )
+    _scheduler.start()
+    log.info("Scheduler started — EWURA sync: 6th of month 07:00 EAT · Brent sync: 5th of month 06:00 UTC")
+
     yield
+
+    _scheduler.shutdown(wait=False)
+    log.info("Scheduler shut down")
 
 
 app = FastAPI(
@@ -2741,6 +2860,129 @@ def analytics_brent(
     )
     cache_set(cache_key, result)
     return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public Documents Listing
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@app.get(
+    "/api/v1/documents",
+    tags=["Discovery"],
+    description=(
+        "Lists all EWURA fuel-price PDF bulletins that have been successfully imported. "
+        "Returns each bulletin's effective date, PDF URL, number of records imported, "
+        "and when it was synced. Newest bulletins first. Deduplicated by effective date."
+    ),
+)
+def list_documents(
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    _check_rate_limit(request)
+    cache_key = "documents:list"
+    hit = cache_get(cache_key)
+    if hit is not None:
+        return hit
+
+    # For each effective_date, keep only the latest successful sync entry
+    subq = (
+        db.query(
+            SyncLog.effective_date,
+            func.max(SyncLog.id).label("max_id"),
+        )
+        .filter(
+            SyncLog.status == "success",
+            SyncLog.pdf_url.isnot(None),
+            SyncLog.effective_date.isnot(None),
+        )
+        .group_by(SyncLog.effective_date)
+        .subquery()
+    )
+
+    rows = (
+        db.query(SyncLog)
+        .join(subq, SyncLog.id == subq.c.max_id)
+        .order_by(SyncLog.effective_date.desc())
+        .all()
+    )
+
+    documents = [
+        {
+            "effective_date": r.effective_date,
+            "pdf_url": r.pdf_url,
+            "records_imported": r.records_upserted,
+            "synced_at": r.triggered_at,
+            "has_local_pdf": os.path.exists(_get_stored_pdf_path(r.effective_date)),
+        }
+        for r in rows
+        if r.effective_date
+    ]
+
+    result = {"total": len(documents), "documents": documents}
+    cache_set(cache_key, result)
+    return result
+
+
+@app.get(
+    "/api/v1/documents/{doc_date}/pdf",
+    tags=["Discovery"],
+    description=(
+        "Serve the stored EWURA bulletin PDF for a given effective date. "
+        "If the PDF is not cached locally, proxies from the original EWURA URL. "
+        "Returns 404 if neither local file nor EWURA URL is available."
+    ),
+    response_class=FileResponse,
+)
+def serve_document_pdf(
+    doc_date: str,
+    request: Request = None,
+    db: Session = Depends(get_db),
+):
+    _check_rate_limit(request)
+    try:
+        eff_date = date.fromisoformat(doc_date)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format — use YYYY-MM-DD")
+
+    local_path = _get_stored_pdf_path(eff_date)
+    if os.path.exists(local_path):
+        return FileResponse(
+            local_path,
+            media_type="application/pdf",
+            filename=f"ewura_fuel_prices_{doc_date}.pdf",
+        )
+
+    # Fall back to proxying the original EWURA URL
+    row = (
+        db.query(SyncLog)
+        .filter(
+            SyncLog.effective_date == eff_date,
+            SyncLog.status == "success",
+            SyncLog.pdf_url.isnot(None),
+        )
+        .order_by(SyncLog.id.desc())
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="PDF not found for this date")
+
+    try:
+        resp = requests.get(row.pdf_url, headers=_HTTP_HEADERS, timeout=30, stream=True)
+        resp.raise_for_status()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch PDF from EWURA: {exc}") from exc
+
+    def _stream():
+        for chunk in resp.iter_content(chunk_size=65536):
+            yield chunk
+
+    return StreamingResponse(
+        _stream(),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="ewura_fuel_prices_{doc_date}.pdf"'},
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

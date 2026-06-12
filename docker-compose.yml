@@ -8,6 +8,8 @@ services:
       ADMIN_SECRET_KEY: ${ADMIN_SECRET_KEY:-change-me}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CACHE_TTL_SECONDS: ${CACHE_TTL_SECONDS:-300}
+    volumes:
+      - ./pdfs:/data/pdfs
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
       interval: 30s
