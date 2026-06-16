@@ -12,3 +12,4 @@ statsmodels>=0.14.0
 scikit-learn>=1.4.0
 numpy>=1.26.0
 apscheduler>=3.10.0
+yfinance>=0.2.40

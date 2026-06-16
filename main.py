@@ -1119,6 +1119,75 @@ def _sync_brent_prices() -> dict:
         db.close()
 
 
+def _sync_brent_spot_yf() -> dict:
+    """Fetch recent Brent crude daily closes from Yahoo Finance (BZ=F ticker)
+    and upsert the month-to-date average for the current month only.
+
+    No API key needed. Runs daily to keep the current (incomplete) month accurate
+    since EIA publishes with a ~30-day lag. Completed months are left to EIA.
+    """
+    try:
+        import yfinance as yf
+    except ImportError:
+        log.warning("Brent YF sync: yfinance not installed — skipping")
+        return {"status": "skipped", "reason": "yfinance not installed"}
+
+    try:
+        ticker = yf.Ticker("BZ=F")
+        hist = ticker.history(period="40d")
+    except Exception as exc:
+        log.error("Brent YF sync: fetch failed — %s", exc)
+        return {"status": "failed", "error": str(exc)}
+
+    if hist.empty:
+        log.warning("Brent YF sync: Yahoo Finance returned empty history")
+        return {"status": "no_data"}
+
+    today = date.today()
+    # Collect only trading days in the current month
+    current_month_prices: List[float] = []
+    for dt, row in hist.iterrows():
+        if dt.year == today.year and dt.month == today.month:
+            close = float(row["Close"])
+            if close > 0:
+                current_month_prices.append(close)
+
+    if not current_month_prices:
+        return {"status": "no_data", "reason": "No trading days found for current month"}
+
+    avg = round(sum(current_month_prices) / len(current_month_prices), 2)
+    price_date = date(today.year, today.month, 1)
+
+    db = SessionLocal()
+    try:
+        existing = db.query(BrentCrude).filter(BrentCrude.price_date == price_date).first()
+        if existing:
+            existing.price_usd = avg
+            action = "updated"
+        else:
+            db.add(BrentCrude(price_date=price_date, price_usd=avg))
+            action = "inserted"
+        db.commit()
+        cache_clear()
+        log.info(
+            "Brent YF sync done — %s %s = $%.2f (%d trading days)",
+            action, price_date, avg, len(current_month_prices),
+        )
+        return {
+            "status": "ok",
+            action: 1,
+            "month": str(price_date),
+            "price_usd": avg,
+            "trading_days": len(current_month_prices),
+        }
+    except Exception as exc:
+        db.rollback()
+        log.exception("Brent YF sync DB error: %s", exc)
+        return {"status": "failed", "error": str(exc)}
+    finally:
+        db.close()
+
+
 def _sync_tzs_usd_rates() -> dict:
     """Fetch TZS/USD exchange rates and upsert into DB.
 
@@ -1239,11 +1308,19 @@ async def _scheduled_ewura_sync():
 
 
 async def _scheduled_brent_sync():
-    """Monthly Brent crude sync — runs in a thread pool."""
+    """Monthly Brent crude sync — EIA historical data, runs in a thread pool."""
     log.info("Scheduled Brent sync triggered")
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _sync_brent_prices)
     log.info("Scheduled Brent sync result: %s", result)
+
+
+async def _scheduled_brent_spot_sync():
+    """Daily Brent spot sync — Yahoo Finance current-month data, runs in a thread pool."""
+    log.info("Scheduled Brent spot sync triggered")
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _sync_brent_spot_yf)
+    log.info("Scheduled Brent spot sync result: %s", result)
 
 
 async def _scheduled_fx_sync():
@@ -1297,6 +1374,13 @@ async def lifespan(app: FastAPI):
         id="brent_monthly",
         replace_existing=True,
     )
+    # Daily Brent spot sync via Yahoo Finance — keeps current month accurate (EIA lags ~30 days)
+    _scheduler.add_job(
+        _scheduled_brent_spot_sync,
+        CronTrigger(hour=8, minute=0, timezone="UTC"),
+        id="brent_daily_spot",
+        replace_existing=True,
+    )
     # Exchange rate sync: World Bank updates annually; open.er-api gives current spot on the 5th
     _scheduler.add_job(
         _scheduled_fx_sync,
@@ -1305,7 +1389,10 @@ async def lifespan(app: FastAPI):
         replace_existing=True,
     )
     _scheduler.start()
-    log.info("Scheduler started — EWURA sync: 6th 07:00 EAT · Brent sync: 5th 06:00 UTC · FX sync: 5th 06:30 UTC")
+    log.info(
+        "Scheduler started — EWURA sync: 6th 07:00 EAT · "
+        "Brent EIA: 5th 06:00 UTC · Brent spot (YF): daily 08:00 UTC · FX sync: 5th 06:30 UTC"
+    )
 
     # Seed exchange rate history on first boot if table is empty
     loop = asyncio.get_event_loop()
@@ -1340,6 +1427,40 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Cache", "X-Total-Count"],
 )
+
+_ANALYTICS_URL = os.getenv("ANALYTICS_URL", "http://analytics:8000")
+_ANALYTICS_KEY = os.getenv("ANALYTICS_KEY", "")
+
+def _post_hit_fuel(payload: dict) -> None:
+    try:
+        import urllib.request as _ur, json as _j
+        data = _j.dumps(payload).encode()
+        req = _ur.Request(
+            f"{_ANALYTICS_URL}/hit", data=data,
+            headers={"Content-Type": "application/json", "X-Analytics-Key": _ANALYTICS_KEY},
+            method="POST",
+        )
+        _ur.urlopen(req, timeout=2)
+    except Exception:
+        pass
+
+@app.middleware("http")
+async def _analytics_mw(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    if path not in {"/health", "/docs", "/redoc", "/openapi.json"}:
+        import threading
+        ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+              or (request.client.host if request.client else ""))
+        threading.Thread(target=_post_hit_fuel, daemon=True, args=({
+            "project": "tz-fuel-api", "path": path, "ip": ip,
+            "user_agent": request.headers.get("user-agent", ""),
+            "referrer": request.headers.get("referer", ""),
+            "language": request.headers.get("accept-language", "").split(",")[0].strip(),
+            "is_action": request.method == "POST",
+            "status_code": response.status_code,
+        },)).start()
+    return response
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3473,13 +3594,18 @@ def sync_brent(db: Session = Depends(get_db)):
     # Bust forecast cache so next call uses the updated Brent data
     cache_clear()
 
-    return {
+    eia_result = {
         "status": "ok",
         "inserted": upserted,
         "updated": skipped,
         "total_synced": upserted + skipped,
         "latest_period": rows[0].get("period") if rows else None,
     }
+
+    # Also pull recent spot prices from Yahoo Finance to cover the current (incomplete) month
+    yf_result = _sync_brent_spot_yf()
+
+    return {"eia": eia_result, "yahoo_finance": yf_result}
 
 
 @app.post(
