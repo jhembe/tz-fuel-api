@@ -1360,10 +1360,12 @@ async def lifespan(app: FastAPI):
     )
 
     # Schedule automatic monthly syncs
-    # EWURA publishes new bulletins around the 1st–5th; run on the 6th to be safe
+    # EWURA publishes new bulletins around the 1st–5th but is sometimes late;
+    # retry daily from the 6th through the 20th — sync is an upsert keyed on
+    # (district_id, effective_date), so re-running after success is a no-op.
     _scheduler.add_job(
         _scheduled_ewura_sync,
-        CronTrigger(day=6, hour=7, minute=0, timezone="Africa/Dar_es_Salaam"),
+        CronTrigger(day="6-20", hour=7, minute=0, timezone="Africa/Dar_es_Salaam"),
         id="ewura_monthly",
         replace_existing=True,
     )
@@ -1390,7 +1392,7 @@ async def lifespan(app: FastAPI):
     )
     _scheduler.start()
     log.info(
-        "Scheduler started — EWURA sync: 6th 07:00 EAT · "
+        "Scheduler started — EWURA sync: 6th-20th 07:00 EAT · "
         "Brent EIA: 5th 06:00 UTC · Brent spot (YF): daily 08:00 UTC · FX sync: 5th 06:30 UTC"
     )
 
